@@ -34,6 +34,8 @@
     python snake.py
 
 操作说明：
+    - 启动后：按 空格 或 方向键 / WASD 开始游戏（窗口会自动获得焦点，
+      无需先用鼠标点击窗口）
     - 方向键 / WASD ：控制移动方向
     - 空格          ：暂停 / 继续（游戏结束后按空格重新开始）
     - R             ：重新开始
@@ -314,12 +316,14 @@ class SnakeGame:
         self.banner_after_id = None
         self.banner_text = None
         self.canvas.focus_set()
-        self.reset()
+        self.reset(ready=True)
+        # 窗口显示后强制获得键盘焦点：否则要先用鼠标点一下窗口按键才生效
+        self.root.after(30, self._grab_focus)
 
     # ---------- 状态管理 ----------
 
-    def reset(self, *args):
-        """开始新一局。"""
+    def reset(self, *args, ready=False):
+        """开始新一局；ready=True 时停在“按任意键开始”画面等待玩家。"""
         self.cancel_tick()
         self.cancel_banner()
         cx, cy = GRID_WIDTH // 2, GRID_HEIGHT // 2
@@ -336,10 +340,37 @@ class SnakeGame:
         self.game_over = False
         self.show_board = False
         self.banner_text = None
+        self.ready = bool(ready)
         self.food = self.spawn_food()
+        self.sound.play("start")  # 开局提示音，也便于验证声音是否正常
+        if self.ready:
+            # 就绪画面：不自动开跑，等玩家按键
+            self.cancel_tick()
+            self.update_status("按 空格 或 方向键 开始")
+            self.draw_ready_overlay()
+        else:
+            self.update_status("空格 暂停 · H 排行榜 · M 音效")
+            self.draw()
+            self.schedule_tick()
+
+    def _grab_focus(self):
+        """把键盘焦点抢到游戏窗口/画布上，保证按键无需先点窗口。"""
+        try:
+            self.root.lift()
+            self.root.focus_force()
+            self.canvas.focus_set()
+        except tk.TclError:
+            pass  # 窗口已关闭等情况直接忽略
+
+    def begin_play(self):
+        """从就绪画面开始游戏。"""
+        self.ready = False
+        self.game_over = False
+        self.paused = False
+        self.show_board = False
         self.update_status("空格 暂停 · H 排行榜 · M 音效")
         self.draw()
-        self.sound.play("start")  # 开局提示音，也便于验证声音是否正常
+        self.schedule_tick()
 
     def cancel_tick(self):
         if self.after_id is not None:
@@ -360,7 +391,14 @@ class SnakeGame:
         return max(MIN_SPEED, INIT_SPEED - (level - 1) * SPEED_STEP)
 
     def update_status(self, hint=""):
-        state = "游戏结束" if self.game_over else ("已暂停" if self.paused else "进行中")
+        if self.ready:
+            state = "就绪"
+        elif self.game_over:
+            state = "游戏结束"
+        elif self.paused:
+            state = "已暂停"
+        else:
+            state = "进行中"
         sound_txt = "开" if not self.sound.muted else "关"
         text = (f"{state}    关卡 {self.level}    分数 {self.score}    "
                 f"最高 {self.hi_score}    声音 {sound_txt}")
@@ -397,7 +435,7 @@ class SnakeGame:
 
     def tick(self):
         """每帧：移动、碰撞判定、成长、关卡推进。"""
-        if self.game_over or self.paused or self.show_board:
+        if self.game_over or self.paused or self.show_board or self.ready:
             return  # 不重新排程，处于冻结状态
 
         self.direction = self.pending_direction
@@ -490,6 +528,8 @@ class SnakeGame:
             f"{title}\n最终分数：{self.score}（第 {self.level} 关）\n\n"
             "按 空格 或 R 重新开始　·　H 排行榜"
         )
+        # 昵称输入框可能抢走焦点，稍后夺回，保证按 R/空格 直接有效
+        self.root.after(30, self._grab_focus)
 
     # ---------- 输入 ----------
 
@@ -513,6 +553,18 @@ class SnakeGame:
         # 排行榜
         if char == "h":
             self.toggle_board()
+            return
+
+        # 就绪画面：按 空格 / 方向键 / WASD 开始游戏
+        if self.ready:
+            if key == "space":
+                self.begin_play()
+                return
+            new_dir = DIRECTIONS.get(key) or WASD.get(char)
+            if new_dir is not None:
+                self.direction = new_dir      # 朝按下的方向开始移动
+                self.pending_direction = new_dir
+                self.begin_play()
             return
 
         # 空格：暂停 / 继续 / 重开
@@ -566,10 +618,21 @@ class SnakeGame:
             self.update_status("H 关闭排行榜")
         else:
             self.update_status()
-            if not self.game_over and not self.paused:
+            if self.ready:
+                self.draw_ready_overlay()          # 尚未开始，回到就绪画面
+            elif not self.game_over and not self.paused:
                 self.schedule_tick()
             else:
                 self.draw()
+
+    def draw_ready_overlay(self):
+        """开始画面。"""
+        self.draw_center_text(
+            "贪吃蛇 Snake\n"
+            "方向键 / WASD 移动 · 空格 暂停\n\n"
+            "按 空格 或 方向键 开始\n"
+            "（H 排行榜 · M 音效 · Esc 退出）",
+            size=16, semi=True)
 
     def show_banner(self, text, color):
         self.banner_text = (text, color)

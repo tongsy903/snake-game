@@ -212,32 +212,69 @@ def build_wav(notes, rate=22050, amp=11000):
 # ---------------- 音效 ----------------
 
 class SoundManager:
-    """Windows 下用 winsound 播放合成音效；其他平台自动静音。"""
+    """
+    Windows 下用 winsound 播放音效；其他平台自动静音。
+
+    注意：winsound 不支持“从内存异步播放”（SND_MEMORY + SND_ASYNC 会抛
+    RuntimeError），因此这里把合成好的 WAV 写入临时目录，再以文件方式
+    异步播放（SND_FILENAME | SND_ASYNC），程序退出时自动清理临时文件。
+    """
 
     def __init__(self):
         self.muted = False
+        self._winsound = None
+        self._paths = {}
         try:
             import winsound
-            self._play = winsound.PlaySound
-            self._ok = True
+            self._winsound = winsound
         except ImportError:
-            self._ok = False
+            pass  # 非 Windows：自动静音
+
         self.sounds = {
+            "start": build_wav([(523, 60), (784, 90)]),
             "eat": build_wav([(880, 45), (1175, 60)]),
             "levelup": build_wav([(660, 70), (880, 70), (1175, 100)]),
             "gameover": build_wav([(523, 120), (392, 120), (262, 240)]),
             "record": build_wav([(784, 80), (988, 80), (1175, 80), (1568, 180)]),
         }
+        if self._winsound is not None:
+            self._prepare_files()
+
+    def _prepare_files(self):
+        """把内置音效写入临时 WAV 文件，供异步播放。"""
+        import atexit
+        import tempfile
+
+        prefix = f"snake_sfx_{os.getpid()}_"
+        try:
+            for name, data in self.sounds.items():
+                path = os.path.join(tempfile.gettempdir(), prefix + name + ".wav")
+                with open(path, "wb") as f:
+                    f.write(data)
+                self._paths[name] = path
+        except OSError:
+            self._paths.clear()  # 临时目录不可写则放弃音效
+            return
+        atexit.register(self._cleanup)
+
+    def _cleanup(self):
+        for path in self._paths.values():
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self._paths.clear()
 
     def play(self, name):
-        if self.muted or not self._ok:
+        if self.muted or self._winsound is None:
             return
-        data = self.sounds.get(name)
-        if not data:
+        path = self._paths.get(name)
+        if not path:
             return
         try:
-            # SND_ASYNC：不阻塞游戏主循环；SND_MEMORY：播放内存中的 WAV
-            self._play(data, 0x0001 | 0x0004)
+            # SND_FILENAME(文件) + SND_ASYNC(异步)：不阻塞游戏主循环
+            self._winsound.PlaySound(
+                path, self._winsound.SND_FILENAME | self._winsound.SND_ASYNC)
         except Exception:
             pass
 
@@ -302,6 +339,7 @@ class SnakeGame:
         self.food = self.spawn_food()
         self.update_status("空格 暂停 · H 排行榜 · M 音效")
         self.draw()
+        self.sound.play("start")  # 开局提示音，也便于验证声音是否正常
 
     def cancel_tick(self):
         if self.after_id is not None:
@@ -438,9 +476,11 @@ class SnakeGame:
             if self.score >= self.hi_score:
                 is_record = True
                 self.hi_score = self.score
-                self.sound.play("record")
         else:
             self.hi_score = max(self.hi_score, self.score)
+
+        # 通关或破纪录播号角声，其余情况播游戏结束音
+        self.sound.play("record" if (victory or is_record) else "gameover")
 
         title = "恭喜通关！" if victory else "游戏结束"
         if is_record:
@@ -462,9 +502,11 @@ class SnakeGame:
             self.root.destroy()
             return
 
-        # 声音开关
+        # 声音开关（取消静音时播提示音便于确认）
         if char == "m":
             self.sound.muted = not self.sound.muted
+            if not self.sound.muted:
+                self.sound.play("start")
             self.update_status()
             return
 

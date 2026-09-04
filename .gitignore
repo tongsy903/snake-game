@@ -1,0 +1,13 @@
+# ===== 运行时数据（不要提交）=====
+snake_highscores.json
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+
+# ===== 本地工作流约定（含本机路径，不外传）=====
+WORKFLOW.md

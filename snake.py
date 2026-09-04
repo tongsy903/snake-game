@@ -56,6 +56,7 @@ import math
 import os
 import random
 import struct
+import time
 import wave
 from collections import deque
 
@@ -75,16 +76,38 @@ OBSTACLE_GAP = 3          # 障碍墙之间的最小间距（切比雪夫距离�
 SCORE_FILE = "snake_highscores.json"
 MAX_SCORES = 10           # 排行榜保留条数
 
-# 颜色
-COLOR_BG = "#1e1e2e"
-COLOR_GRID = "#28283a"
-COLOR_SNAKE_HEAD = "#a6e3a1"
-COLOR_SNAKE_BODY = "#94e2d5"
-COLOR_FOOD = "#f38ba8"
-COLOR_OBSTACLE = "#cba6f7"
+ANIM_FPS = 60             # 移动平滑动画的帧率
+SNAKE_RADIUS = 0.38       # 蛇身半径（相对格子边长）
+
+# 颜色（Catppuccin Mocha 系配色）
+COLOR_BG = "#1e1e2e"            # 窗口底色
+COLOR_CHECKER_A = "#1f1f31"     # 棋盘格 A
+COLOR_CHECKER_B = "#26263b"     # 棋盘格 B
+COLOR_FRAME = "#313244"         # 棋盘外框
+COLOR_PANEL = "#181825"         # 顶部状态栏 / 浮层面板
 COLOR_TEXT = "#cdd6f4"
 COLOR_HINT = "#6c7086"
 COLOR_BANNER = "#f9e2af"
+
+# 蛇（头→尾渐变）
+SNAKE_HEAD_RGB = (0x8a, 0xe8, 0x9b)
+SNAKE_TAIL_RGB = (0x4f, 0xa3, 0x97)
+SNAKE_OUTLINE = "#0e0e18"
+EYE_WHITE = "#ffffff"
+EYE_PUPIL = "#11111b"
+
+# 食物（高光苹果）
+FOOD_MAIN = "#f0506e"           # 果身主色
+FOOD_SHADE = "#c2255c"          # 果身暗部
+FOOD_HILIGHT = "#ffb3c1"        # 高光
+FOOD_STEM = "#7f5539"           # 果柄
+FOOD_LEAF = "#7bc47f"           # 叶子
+
+# 障碍
+OBSTACLE_FILL = "#cba6f7"
+OBSTACLE_EDGE = "#8f7ac0"
+OBSTACLE_HILIGHT = "#e6dcff"
+
 FONT = "Microsoft YaHei"
 
 DIRECTIONS = {
@@ -101,6 +124,31 @@ WASD = {
 }
 
 # ---------------- 纯函数工具（便于测试） ----------------
+
+def hex_to_rgb(color):
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def mix_color(c1, c2, t):
+    """在两种 #rrggbb 颜色之间线性插值，返回 #rrggbb。"""
+    t = max(0.0, min(1.0, t))
+    a, b = hex_to_rgb(c1), hex_to_rgb(c2)
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def cell_center(pos):
+    return (pos[0] * CELL_SIZE + CELL_SIZE / 2,
+            pos[1] * CELL_SIZE + CELL_SIZE / 2)
+
+
+def lerp_point(p1, p2, t):
+    return (lerp(p1[0], p2[0], t), lerp(p1[1], p2[1], t))
+
 
 def default_scores_path():
     """排行榜文件默认保存在本脚本同目录下。"""
@@ -288,6 +336,7 @@ class SnakeGame:
         self.root = root
         self.root.title("贪吃蛇 Snake")
         self.root.resizable(False, False)
+        self.root.configure(bg=COLOR_PANEL)
 
         self.canvas = tk.Canvas(
             root,
@@ -296,16 +345,16 @@ class SnakeGame:
             bg=COLOR_BG,
             highlightthickness=0,
         )
-        self.canvas.pack()
+        self.canvas.pack(padx=6, pady=(6, 0))
 
         self.status_label = tk.Label(
             root,
             text="",
             font=(FONT, 11, "bold"),
             fg=COLOR_TEXT,
-            bg=COLOR_BG,
+            bg=COLOR_PANEL,
         )
-        self.status_label.pack(fill="x", pady=4)
+        self.status_label.pack(fill="x", padx=10, pady=7)
 
         self.root.bind("<KeyPress>", self.on_key)
 
@@ -313,9 +362,12 @@ class SnakeGame:
         self.scores = load_scores()
         self.hi_score = self.scores[0]["score"] if self.scores else 0
         self.after_id = None
+        self.anim_after_id = None      # 平滑移动动画定时器
+        self._trans = None             # 当前移动过渡信息
         self.banner_after_id = None
         self.banner_text = None
         self.canvas.focus_set()
+        self._build_board()            # 静态棋盘背景（只需画一次）
         self.reset(ready=True)
         # 窗口显示后强制获得键盘焦点：否则要先用鼠标点一下窗口按键才生效
         self.root.after(30, self._grab_focus)
@@ -325,6 +377,7 @@ class SnakeGame:
     def reset(self, *args, ready=False):
         """开始新一局；ready=True 时停在“按任意键开始”画面等待玩家。"""
         self.cancel_tick()
+        self.cancel_anim()
         self.cancel_banner()
         cx, cy = GRID_WIDTH // 2, GRID_HEIGHT // 2
         self.snake = [(cx, cy), (cx - 1, cy), (cx - 2, cy)]
@@ -377,10 +430,59 @@ class SnakeGame:
             self.root.after_cancel(self.after_id)
             self.after_id = None
 
+    def cancel_anim(self):
+        """停止平滑移动动画。"""
+        if self.anim_after_id is not None:
+            self.root.after_cancel(self.anim_after_id)
+            self.anim_after_id = None
+        self._trans = None
+
     def schedule_tick(self):
         """安排下一帧移动（先取消旧回调，防止叠加导致加速）。"""
         self.cancel_tick()
         self.after_id = self.root.after(self.speed, self.tick)
+
+    def start_transition(self, old_snake, grew):
+        """
+        开始一次平滑移动：从 old_snake 的各格位置滑动到 self.snake
+        的当前位置，动画时长与一次逻辑步进一致。
+        """
+        self.cancel_anim()
+        self._trans = {
+            "old": old_snake,
+            "grew": grew,
+            "t0": time.monotonic(),
+            "dur": max(0.03, self.speed) / 1000.0,
+        }
+        self._anim_frame()
+
+    def _anim_frame(self):
+        """平滑动画的一帧（固定帧率，逻辑移动间隔内插值渲染）。"""
+        self.anim_after_id = None
+        if self._trans is None:
+            return
+        f = (time.monotonic() - self._trans["t0"]) / self._trans["dur"]
+        if f >= 1.0:
+            self._trans = None
+            self.draw()          # 过渡结束：画最终画面
+            return
+        self.canvas.delete("dynamic")
+        self._paint(self._points_at(f))
+        self.anim_after_id = self.root.after(
+            int(1000 / ANIM_FPS), self._anim_frame)
+
+    def _points_at(self, f):
+        """过渡进度 f∈[0,1] 时蛇身各节点的像素坐标（头→尾）。"""
+        old = self._trans["old"]
+        pts = [lerp_point(cell_center(old[0]), cell_center(self.snake[0]), f)]
+        pts.extend(cell_center(p) for p in self.snake[1:])
+        if not self._trans["grew"] and f < 0.999:
+            # 未吃食物：尾巴会缩短一格，让尾尖从被弹出的旧尾格滑向新尾格
+            tail_from = cell_center(old[-1])
+            tail_to = pts[-1]
+            if abs(tail_from[0] - tail_to[0]) + abs(tail_from[1] - tail_to[1]) > 0.1:
+                pts.append(lerp_point(tail_from, tail_to, f))
+        return pts
 
     def cancel_banner(self):
         if self.banner_after_id is not None:
@@ -457,6 +559,7 @@ class SnakeGame:
             self.end_game()
             return
 
+        old_snake = list(self.snake)  # 记录动画起点
         self.snake.insert(0, new_head)
         if will_grow:
             self.food = None  # 占位，稍后重放
@@ -479,12 +582,13 @@ class SnakeGame:
             self.snake.pop()
 
         self.update_status()
-        self.draw()
+        self.start_transition(old_snake, will_grow)  # 平滑滑动到新位置
         self.schedule_tick()
 
     def end_game(self, victory=False):
         """游戏结束（或通关），处理排行榜入库。"""
         self.cancel_tick()
+        self.cancel_anim()
         self.game_over = True
         self.sound.play("record" if victory else "gameover")
 
@@ -602,8 +706,9 @@ class SnakeGame:
         self.paused = not self.paused
         if self.paused:
             self.cancel_tick()
+            self.cancel_anim()
             self.update_status("空格 继续")
-            self.draw_overlay("已暂停\n\n按 空格 继续")
+            self.draw_overlay("已暂停\n\n按 空格 继续", size=15)
         else:
             self.update_status()
             self.draw()
@@ -614,25 +719,30 @@ class SnakeGame:
         self.show_board = not self.show_board
         if self.show_board:
             self.cancel_tick()
+            self.cancel_anim()
             self.draw_board_overlay()
             self.update_status("H 关闭排行榜")
         else:
             self.update_status()
             if self.ready:
                 self.draw_ready_overlay()          # 尚未开始，回到就绪画面
-            elif not self.game_over and not self.paused:
-                self.schedule_tick()
-            else:
+            elif self.game_over:
                 self.draw()
+            elif self.paused:
+                self.draw()
+                self.draw_overlay("已暂停\n\n按 空格 继续")
+            else:
+                self.schedule_tick()
 
     def draw_ready_overlay(self):
         """开始画面。"""
-        self.draw_center_text(
+        self.draw()
+        self.draw_overlay(
             "贪吃蛇 Snake\n"
             "方向键 / WASD 移动 · 空格 暂停\n\n"
             "按 空格 或 方向键 开始\n"
             "（H 排行榜 · M 音效 · Esc 退出）",
-            size=16, semi=True)
+            size=15)
 
     def show_banner(self, text, color):
         self.banner_text = (text, color)
@@ -648,72 +758,173 @@ class SnakeGame:
 
     # ---------- 绘制 ----------
 
+    def _build_board(self):
+        """一次性绘制静态棋盘背景与边框（标签 'static'，此后不重画）。"""
+        w, h = GRID_WIDTH * CELL_SIZE, GRID_HEIGHT * CELL_SIZE
+        self.canvas.create_rectangle(0, 0, w, h, fill=COLOR_BG, outline="",
+                                     tags=("static",))
+        for cy in range(GRID_HEIGHT):
+            for cx in range(GRID_WIDTH):
+                fill = COLOR_CHECKER_A if (cx + cy) % 2 == 0 else COLOR_CHECKER_B
+                self.canvas.create_rectangle(
+                    cx * CELL_SIZE, cy * CELL_SIZE,
+                    (cx + 1) * CELL_SIZE, (cy + 1) * CELL_SIZE,
+                    fill=fill, outline="", tags=("static",))
+        self.canvas.create_rectangle(0.5, 0.5, w - 0.5, h - 0.5,
+                                     outline=COLOR_FRAME, width=2,
+                                     tags=("static",))
+
     def draw(self):
-        self.canvas.delete("all")
-        # 网格
-        for x in range(0, GRID_WIDTH * CELL_SIZE, CELL_SIZE):
-            self.canvas.create_line(x, 0, x, GRID_HEIGHT * CELL_SIZE, fill=COLOR_GRID)
-        for y in range(0, GRID_HEIGHT * CELL_SIZE, CELL_SIZE):
-            self.canvas.create_line(0, y, GRID_WIDTH * CELL_SIZE, y, fill=COLOR_GRID)
+        """整帧重绘：逻辑当前位置的静态画面。"""
+        self.canvas.delete("dynamic", "overlay")
+        self._paint([cell_center(p) for p in self.snake])
 
-        # 食物
-        if self.food is not None:
-            fx, fy = self.food
-            pad = 3
-            self.canvas.create_oval(
-                fx * CELL_SIZE + pad,
-                fy * CELL_SIZE + pad,
-                (fx + 1) * CELL_SIZE - pad,
-                (fy + 1) * CELL_SIZE - pad,
-                fill=COLOR_FOOD,
-                outline=COLOR_FOOD,
-            )
-
-        # 障碍墙
-        for (ox, oy) in self.obstacles:
-            self.canvas.create_rectangle(
-                ox * CELL_SIZE + 1,
-                oy * CELL_SIZE + 1,
-                (ox + 1) * CELL_SIZE - 1,
-                (oy + 1) * CELL_SIZE - 1,
-                fill=COLOR_OBSTACLE,
-                outline=COLOR_OBSTACLE,
-            )
-
-        # 蛇
-        for i, (sx, sy) in enumerate(self.snake):
-            color = COLOR_SNAKE_HEAD if i == 0 else COLOR_SNAKE_BODY
-            self.canvas.create_rectangle(
-                sx * CELL_SIZE,
-                sy * CELL_SIZE,
-                (sx + 1) * CELL_SIZE,
-                (sy + 1) * CELL_SIZE,
-                fill=color,
-                outline=COLOR_BG,
-                width=1,
-            )
-
-        # 过关横幅
+    def _paint(self, pts):
+        """绘制动态内容（食物 / 障碍 / 蛇 / 过关横幅）。"""
+        self._draw_food()
+        self._draw_obstacles()
+        self._draw_snake(pts)
         if self.banner_text:
             text, color = self.banner_text
-            self.draw_center_text(text, color=color, size=24, semi=True)
+            self._dim_board()
+            self._center_text(text, color=color, size=26)
+
+    def _dim_board(self, color="#000000", stipple="gray50", tags=("dynamic",)):
+        self.canvas.create_rectangle(
+            0, 0, GRID_WIDTH * CELL_SIZE, GRID_HEIGHT * CELL_SIZE,
+            fill=color, stipple=stipple, outline="", tags=tags)
 
     def _center(self):
         return GRID_WIDTH * CELL_SIZE // 2, GRID_HEIGHT * CELL_SIZE // 2
 
-    def draw_center_text(self, text, color=COLOR_TEXT, size=18, semi=False):
-        """在画布中央绘制多行文本；semi=True 时加半透明底。"""
-        if semi:
-            self.canvas.create_rectangle(
-                0, 0, GRID_WIDTH * CELL_SIZE, GRID_HEIGHT * CELL_SIZE,
-                fill="#000000", stipple="gray50", outline="")
+    def _center_text(self, text, color=COLOR_TEXT, size=18, tags=("dynamic",)):
         cx, cy = self._center()
         self.canvas.create_text(
-            cx, cy, text=text, fill=color,
-            font=(FONT, size, "bold"), justify="center")
+            cx, cy, text=text, fill=color, font=(FONT, size, "bold"),
+            justify="center", tags=tags)
 
-    def draw_overlay(self, text):
-        self.draw_center_text(text, semi=True)
+    def _round_rect_item(self, x0, y0, x1, y1, r=12, **kw):
+        """用平滑多边形近似圆角矩形。"""
+        pts = [
+            x0 + r, y0, x1 - r, y0,
+            x1, y0, x1, y0 + r,
+            x1, y1 - r, x1, y1,
+            x1 - r, y1, x0 + r, y1,
+            x0, y1, x0, y1 - r,
+            x0, y0 + r, x0, y0,
+        ]
+        return self.canvas.create_polygon(
+            *pts, smooth=True, splinesteps=24, **kw)
+
+    def _draw_food(self):
+        """食物：带高光的小苹果。"""
+        if self.food is None:
+            return
+        tags = ("dynamic",)
+        cx, cy = cell_center(self.food)
+        r = CELL_SIZE * 0.46
+        # 果柄与叶子
+        self.canvas.create_oval(
+            cx + r * 0.10, cy - r * 1.15, cx + r * 0.52, cy - r * 0.35,
+            fill=FOOD_LEAF, outline="", tags=tags)
+        self.canvas.create_line(
+            cx, cy - r * 0.95, cx + 0.5, cy - r * 1.35,
+            fill=FOOD_STEM, width=2, tags=tags)
+        # 果身：暗部做底，主色偏左上，形成立体感
+        self.canvas.create_oval(
+            cx - r, cy - r * 0.94, cx + r, cy + r * 1.06,
+            fill=FOOD_SHADE, outline="", tags=tags)
+        self.canvas.create_oval(
+            cx - r, cy - r, cx + r, cy + r,
+            fill=FOOD_MAIN, outline="", tags=tags)
+        # 高光
+        self.canvas.create_oval(
+            cx - r * 0.62, cy - r * 0.72, cx - r * 0.08, cy - r * 0.16,
+            fill=FOOD_HILIGHT, outline="", tags=tags)
+        self.canvas.create_oval(
+            cx - r * 0.52, cy - r * 0.62, cx - r * 0.30, cy - r * 0.42,
+            fill="#ffffff", outline="", tags=tags)
+
+    def _draw_obstacles(self):
+        """障碍：圆角水晶块，带高光点。"""
+        tags = ("dynamic",)
+        pad = CELL_SIZE * 0.10
+        for ox, oy in self.obstacles:
+            x0 = ox * CELL_SIZE + pad
+            y0 = oy * CELL_SIZE + pad
+            x1 = (ox + 1) * CELL_SIZE - pad
+            y1 = (oy + 1) * CELL_SIZE - pad
+            self._round_rect_item(
+                x0, y0, x1, y1, r=7,
+                fill=OBSTACLE_FILL, outline=OBSTACLE_EDGE, width=2,
+                tags=tags)
+            # 顶部内侧高光
+            self._round_rect_item(
+                x0 + 4, y0 + 4, x1 - 4, y0 + (y1 - y0) * 0.34, r=4,
+                fill=OBSTACLE_HILIGHT, outline="", tags=tags)
+
+    def _draw_snake(self, pts):
+        """蛇：圆头圆尾的胶囊状渐变身体 + 有神的眼睛。"""
+        n = len(pts)
+        if n == 0:
+            return
+        tags = ("dynamic",)
+        r = CELL_SIZE * SNAKE_RADIUS
+        head_hex = "#%02x%02x%02x" % SNAKE_HEAD_RGB
+        tail_hex = "#%02x%02x%02x" % SNAKE_TAIL_RGB
+        colors = [mix_color(head_hex, tail_hex, i / max(1, n - 1))
+                  for i in range(n)]
+
+        def circle(p, radius, fill):
+            self.canvas.create_oval(
+                p[0] - radius, p[1] - radius, p[0] + radius, p[1] + radius,
+                fill=fill, outline="", tags=tags)
+
+        # 1) 深色描边（一条贯通折线，圆角连接）
+        coords = [v for p in pts for v in p]
+        if n > 1:
+            self.canvas.create_line(
+                *coords, width=r * 2 + 3, capstyle=tk.ROUND,
+                joinstyle=tk.ROUND, fill=SNAKE_OUTLINE, tags=tags)
+        # 2) 渐变段
+        for i in range(n - 1):
+            self.canvas.create_line(
+                *pts[i], *pts[i + 1], width=r * 2,
+                capstyle=tk.ROUND, fill=colors[i + 1], tags=tags)
+        # 3) 每个节点画圆，让转弯处圆润平滑
+        for i in range(n):
+            circle(pts[i], r, colors[i])
+        # 4) 头部稍大 + 眼睛
+        head = pts[0]
+        hr = r * 1.15
+        circle(head, hr + 1.5, SNAKE_OUTLINE)
+        circle(head, hr, colors[0])
+        dx, dy = self.direction
+        px, py = -dy, dx
+        for side in (1.0, -1.0):
+            eye = (head[0] + dx * r * 0.35 + px * r * 0.55 * side,
+                   head[1] + dy * r * 0.35 + py * r * 0.55 * side)
+            circle(eye, r * 0.38, EYE_WHITE)
+            pupil = (eye[0] + dx * r * 0.16, eye[1] + dy * r * 0.16)
+            circle(pupil, r * 0.19, EYE_PUPIL)
+
+    def draw_overlay(self, text, size=15, pw=None, ph=None):
+        """居中弹层：压暗背景 + 圆角面板 + 文字。"""
+        self.canvas.delete("overlay")
+        w, h = GRID_WIDTH * CELL_SIZE, GRID_HEIGHT * CELL_SIZE
+        pw = pw or int(w * 0.80)
+        ph = ph or int(h * 0.60)
+        pw = max(140, min(w - 24, pw))
+        ph = max(90, min(h - 24, ph))
+        tags = ("overlay",)
+        self._dim_board(tags=tags)
+        x0, y0 = (w - pw) // 2, (h - ph) // 2
+        self._round_rect_item(
+            x0, y0, x0 + pw, y0 + ph, r=18,
+            fill=COLOR_PANEL, outline="#45475a", width=2, tags=tags)
+        self.canvas.create_text(
+            w // 2, y0 + ph // 2, text=text, fill=COLOR_TEXT,
+            font=(FONT, size, "bold"), justify="center", tags=tags)
 
     def draw_board_overlay(self):
         """排行榜浮层。"""
@@ -722,12 +933,12 @@ class SnakeGame:
             lines.append("（暂无记录，快来创造第一个纪录吧！）")
         else:
             for i, entry in enumerate(self.scores, 1):
-                rank = f"{i}."
-                lines.append(f"{rank:<4}{entry['name']}　{entry['score']} 分"
+                lines.append(f"{i:>2}. {entry['name']}　{entry['score']} 分"
                              f"　· Lv{entry['level']}　{entry['date']}")
-        lines.append("")
-        lines.append("按 H 关闭")
-        self.draw_center_text("\n".join(lines), size=14, semi=True)
+        lines += ["", "按 H 关闭"]
+        w, h = GRID_WIDTH * CELL_SIZE, GRID_HEIGHT * CELL_SIZE
+        self.draw_overlay("\n".join(lines), size=13,
+                          pw=int(w * 0.84), ph=int(h * 0.84))
 
 
 def main():

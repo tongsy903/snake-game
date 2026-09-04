@@ -6,8 +6,6 @@
 #
 # Copyright (c) 2026 tongsy903
 #
-# 使用本项目前，请把上面的版权行改成你自己的名字或组织名称。
-#
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
